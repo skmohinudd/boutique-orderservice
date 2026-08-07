@@ -1,0 +1,1 @@
+package com.boutique.order.repository; import com.boutique.order.entity.OrderEntity;import org.springframework.data.jpa.repository.JpaRepository;import java.util.*; public interface OrderRepository extends JpaRepository<OrderEntity,UUID>{Optional<OrderEntity> findByIdempotencyKey(String key);}
