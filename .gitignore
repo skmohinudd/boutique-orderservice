@@ -28,3 +28,6 @@ github-sync-reports/
 .plain-lambda-backups/
 .final-consolidated-backups/
 .lambda-image-removal-backups/
+code-backup-old/
+migration-backup-old/
+*.backup-*
