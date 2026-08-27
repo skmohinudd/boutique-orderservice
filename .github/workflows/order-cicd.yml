@@ -1,0 +1,495 @@
+
+name: Order Service CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: orderservice-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVICE_NAME: orderservice
+
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "663130434910"
+  ECR_REPOSITORY: boutique-orderservice
+  EKS_CLUSTER_NAME: boutique-dev-eks
+
+  K8S_NAMESPACE: boutique
+  K8S_DEPLOYMENT: orderservice
+  K8S_SERVICE: orderservice
+  HELM_RELEASE: orderservice-dev
+
+  PLATFORM_REPOSITORY: skmohinudd/boutique-platform-infra
+  HELM_CHART_PATH: boutique-platform-infra/helm/orderservice
+
+  SONAR_HOST_URL: http://44.199.205.21:9000
+  SONAR_PROJECT_KEY: boutique-orderservice
+  SONAR_PROJECT_NAME: Boutique Order Service
+
+
+jobs:
+
+  # ==========================================================
+  # PULL REQUEST VALIDATION
+  # Tests and SonarQube run without deploying to AWS.
+  # ==========================================================
+  pr-validation:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+      - name: Run tests
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean test \
+            > /tmp/tests.log 2>&1
+          then
+            echo "Tests passed"
+          else
+            echo "Tests failed"
+            tail -n 80 /tmp/tests.log
+            exit 1
+          fi
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Run SonarQube analysis
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+
+  # ==========================================================
+  # MAIN BRANCH CI/CD
+  # Build -> Sonar -> Nexus -> ECR -> Helm -> EKS
+  # ==========================================================
+  deploy-main:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Order Service
+        uses: actions/checkout@v4
+
+      - name: Checkout platform repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPOSITORY }}
+          path: boutique-platform-infra
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+      # One version identifies Nexus, ECR and EKS deployment.
+      - name: Generate application version
+        run: |
+          APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "JAR_NAME=orderservice-$APP_VERSION.jar" >> "$GITHUB_ENV"
+
+          echo "Application version: $APP_VERSION"
+
+      - name: Validate required secrets
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          AWS_GITHUB_ROLE_ARN: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+        run: |
+          for NAME in \
+            SONAR_TOKEN \
+            NEXUS_USERNAME \
+            NEXUS_PASSWORD \
+            AWS_GITHUB_ROLE_ARN
+          do
+            if [ -z "${!NAME}" ]; then
+              echo "Missing required secret: $NAME"
+              exit 1
+            fi
+          done
+
+          echo "Required GitHub secrets are available"
+
+      # Change Maven project version to the CI version.
+      - name: Set Maven version
+        run: |
+          ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            versions:set \
+            -DnewVersion="$APP_VERSION" \
+            -DgenerateBackupPoms=false
+
+      - name: Run tests and build JAR
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean package \
+            > /tmp/maven-build.log 2>&1
+          then
+            echo "Maven build completed"
+          else
+            echo "Maven build failed"
+            tail -n 100 /tmp/maven-build.log
+            exit 1
+          fi
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      - name: Verify application JAR
+        run: |
+          JAR_FILE="$(find target \
+            -maxdepth 1 \
+            -type f \
+            -name '*.jar' \
+            ! -name 'original-*.jar' \
+            ! -name '*-sources.jar' \
+            ! -name '*-javadoc.jar' \
+            | head -1)"
+
+          if [ -z "$JAR_FILE" ]; then
+            echo "Application JAR was not created"
+            exit 1
+          fi
+
+          echo "Application JAR: $(basename "$JAR_FILE")"
+
+      - name: Run SonarQube analysis
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.projectVersion="$APP_VERSION" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN" \
+            > /tmp/sonar.log 2>&1
+          then
+            echo "SonarQube analysis completed"
+          else
+            echo "SonarQube analysis failed"
+            tail -n 80 /tmp/sonar.log
+            exit 1
+          fi
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # Release JAR is retained outside the temporary GitHub runner.
+      - name: Publish JAR to Nexus
+        run: |
+          if ./mvnw -q \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            deploy \
+            -DskipTests \
+            > /tmp/nexus.log 2>&1
+          then
+            echo "Nexus publish completed: $APP_VERSION"
+          else
+            echo "Nexus publish failed"
+            tail -n 80 /tmp/nexus.log
+            exit 1
+          fi
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+      # Temporary AWS credentials are obtained through GitHub OIDC.
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${APP_VERSION}"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          if docker build \
+            --quiet \
+            --label "org.opencontainers.image.version=$APP_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE_URI" \
+            . \
+            > /tmp/docker-build.log 2>&1
+          then
+            echo "Docker image built: $IMAGE_URI"
+          else
+            echo "Docker build failed"
+            tail -n 100 /tmp/docker-build.log
+            exit 1
+          fi
+
+      - name: Push image to ECR
+        run: |
+          if docker push "$IMAGE_URI" > /tmp/docker-push.log 2>&1
+          then
+            echo "Image pushed to ECR: $IMAGE_URI"
+          else
+            echo "ECR push failed"
+            tail -n 80 /tmp/docker-push.log
+            exit 1
+          fi
+
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME" \
+            >/dev/null
+
+          kubectl get namespace "$K8S_NAMESPACE" >/dev/null
+
+          echo "EKS access verified"
+
+      - name: Validate Helm chart
+        run: |
+          helm lint "$HELM_CHART_PATH"
+
+          helm template "$HELM_RELEASE" "$HELM_CHART_PATH" \
+            -n "$K8S_NAMESPACE" \
+            --set image.tag="$APP_VERSION" \
+            >/tmp/orderservice-rendered.yaml
+
+          echo "OrderService Helm chart validated"
+
+      # OrderService requires PostgreSQL credentials, Kafka and RabbitMQ.
+      - name: Validate Order Service dependencies
+        run: |
+          FAILED=0
+
+          for SERVICE in kafka rabbitmq
+          do
+            if kubectl get service "$SERVICE" \
+              -n "$K8S_NAMESPACE" >/dev/null 2>&1
+            then
+              echo "$SERVICE service available"
+            else
+              echo "$SERVICE service missing"
+              FAILED=1
+            fi
+          done
+
+          for SECRET in boutique-rds-credentials rabbitmq-credentials
+          do
+            if kubectl get secret "$SECRET" \
+              -n "$K8S_NAMESPACE" >/dev/null 2>&1
+            then
+              echo "$SECRET available"
+            else
+              echo "$SECRET missing"
+              FAILED=1
+            fi
+          done
+
+          if ! kubectl get secretproviderclass boutique-rds-secrets \
+            -n "$K8S_NAMESPACE" >/dev/null 2>&1
+          then
+            echo "boutique-rds-secrets SecretProviderClass missing"
+            FAILED=1
+          else
+            echo "AWS Secrets Manager CSI configuration available"
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "OrderService dependency validation failed"
+            exit 1
+          fi
+
+      # Helm performs the rolling deployment. Failed upgrades are rolled back.
+      - name: Deploy Order Service with Helm
+        run: |
+          PREVIOUS_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            2>/dev/null || true)"
+
+          echo "Previous image: ${PREVIOUS_IMAGE:-none}"
+          echo "New image     : $IMAGE_URI"
+
+          if helm upgrade --install "$HELM_RELEASE" "$HELM_CHART_PATH" \
+            -n "$K8S_NAMESPACE" \
+            --set image.tag="$APP_VERSION" \
+            --rollback-on-failure \
+            --cleanup-on-fail \
+            --wait \
+            --timeout 5m \
+            >/tmp/helm-deploy.log 2>&1
+          then
+            echo "Helm deployment completed"
+          else
+            echo "Helm deployment failed"
+            tail -n 100 /tmp/helm-deploy.log
+
+            kubectl get pods \
+              -n "$K8S_NAMESPACE" \
+              -l app="$SERVICE_NAME"
+
+            exit 1
+          fi
+
+      - name: Verify EKS deployment
+        run: |
+          kubectl rollout status deployment/"$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=120s
+
+          DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')"
+
+          DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')"
+
+          echo "Image   : $DEPLOYED_IMAGE"
+          echo "Replicas: ${READY:-0}/$DESIRED"
+
+          if [ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]; then
+            echo "EKS image does not match the CI/CD version"
+            exit 1
+          fi
+
+          if [ "${READY:-0}" != "$DESIRED" ]; then
+            echo "Not all OrderService replicas are ready"
+            exit 1
+          fi
+
+      # Verify traffic through Service -> EndpointSlice -> OrderService Pod.
+      - name: Verify Order Service health
+        run: |
+          ENDPOINTS="$(kubectl get endpointslice \
+            -n "$K8S_NAMESPACE" \
+            -l kubernetes.io/service-name="$K8S_SERVICE" \
+            -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" "}{end}')"
+
+          if [ -z "$ENDPOINTS" ]; then
+            echo "OrderService has no ready service endpoints"
+            exit 1
+          fi
+
+          kubectl delete pod orderservice-health-check \
+            -n "$K8S_NAMESPACE" \
+            --ignore-not-found \
+            >/dev/null 2>&1
+
+          kubectl run orderservice-health-check \
+            -n "$K8S_NAMESPACE" \
+            --restart=Never \
+            --image=curlimages/curl \
+            --command -- \
+            curl --fail --silent --show-error \
+            --connect-timeout 5 \
+            --max-time 15 \
+            "http://${K8S_SERVICE}:8084/actuator/health"
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Succeeded \
+            pod/orderservice-health-check \
+            -n "$K8S_NAMESPACE" \
+            --timeout=60s
+
+          echo "Application health:"
+          kubectl logs orderservice-health-check \
+            -n "$K8S_NAMESPACE"
+
+          kubectl delete pod orderservice-health-check \
+            -n "$K8S_NAMESPACE" \
+            --ignore-not-found \
+            >/dev/null
+
+      - name: Deployment summary
+        run: |
+          echo "OrderService deployment successful"
+          echo "Version: $APP_VERSION"
+          echo "Image  : $IMAGE_URI"
+
+          kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE"
+
+          kubectl get pods \
+            -n "$K8S_NAMESPACE" \
+            -l app="$SERVICE_NAME"
