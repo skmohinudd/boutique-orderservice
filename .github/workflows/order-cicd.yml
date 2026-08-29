@@ -15,7 +15,6 @@ permissions:
   contents: read
   id-token: write
 
-# Prevent overlapping deployments of the same service.
 concurrency:
   group: orderservice-${{ github.ref }}
   cancel-in-progress: false
@@ -31,6 +30,7 @@ env:
   K8S_NAMESPACE: boutique
   K8S_DEPLOYMENT: orderservice
   K8S_SERVICE: orderservice
+  SERVICE_PORT: "8084"
   HELM_RELEASE: orderservice-dev
 
   PLATFORM_REPOSITORY: skmohinudd/boutique-platform-infra
@@ -43,13 +43,17 @@ env:
 
 jobs:
 
-  # PR validation only. Nothing is published or deployed.
+  # ==========================================================
+  # PULL REQUEST VALIDATION
+  # ==========================================================
+
   pr-validation:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -113,7 +117,10 @@ jobs:
           fi
 
 
-  # Main branch: build -> Sonar -> Nexus -> ECR -> Helm -> EKS.
+  # ==========================================================
+  # MAIN BRANCH DEPLOYMENT
+  # ==========================================================
+
   deploy-main:
     if: >-
       github.ref == 'refs/heads/main' &&
@@ -124,6 +131,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
+
       - name: Checkout Order Service
         uses: actions/checkout@v4
         with:
@@ -141,7 +149,11 @@ jobs:
           sed -i 's/\r$//' mvnw
           chmod +x mvnw
 
-      # One immutable version is used across Nexus, ECR and EKS.
+
+      # ======================================================
+      # VERSION
+      # ======================================================
+
       - name: Generate application version
         run: |
           APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
@@ -150,6 +162,11 @@ jobs:
           echo "JAR_NAME=orderservice-$APP_VERSION.jar" >> "$GITHUB_ENV"
 
           echo "Application version: $APP_VERSION"
+
+
+      # ======================================================
+      # REQUIRED SECRETS
+      # ======================================================
 
       - name: Validate required secrets
         env:
@@ -173,6 +190,11 @@ jobs:
 
           echo "Required secrets verified"
 
+
+      # ======================================================
+      # MAVEN BUILD
+      # ======================================================
+
       - name: Set Maven version
         run: |
           if ./mvnw -q \
@@ -189,6 +211,7 @@ jobs:
             tail -n 60 /tmp/version.log
             exit 1
           fi
+
 
       - name: Test and build JAR
         env:
@@ -210,6 +233,11 @@ jobs:
             tail -n 100 /tmp/build.log
             exit 1
           fi
+
+
+      # ======================================================
+      # SONARQUBE
+      # ======================================================
 
       - name: Run SonarQube analysis
         env:
@@ -237,6 +265,11 @@ jobs:
             exit 1
           fi
 
+
+      # ======================================================
+      # NEXUS
+      # ======================================================
+
       - name: Publish JAR to Nexus
         env:
           NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -258,7 +291,11 @@ jobs:
             exit 1
           fi
 
-      # GitHub OIDC provides temporary AWS credentials.
+
+      # ======================================================
+      # AWS OIDC
+      # ======================================================
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.2.3
         with:
@@ -266,6 +303,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: orderservice-${{ github.run_id }}
           allowed-account-ids: "663130434910"
+
 
       - name: Validate AWS and ECR
         run: |
@@ -282,9 +320,15 @@ jobs:
 
           echo "AWS and ECR verified"
 
+
+      # ======================================================
+      # DOCKER / ECR
+      # ======================================================
+
       - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
+
 
       - name: Build Docker image
         env:
@@ -312,7 +356,9 @@ jobs:
             exit 1
           fi
 
+
       # Trivy intentionally disabled for now.
+
 
       - name: Push image to ECR
         run: |
@@ -328,6 +374,7 @@ jobs:
             exit 1
           fi
 
+
       - name: Validate ECR image
         run: |
           IMAGE_DIGEST="$(aws ecr describe-images \
@@ -341,13 +388,21 @@ jobs:
           test "$IMAGE_DIGEST" != "None"
 
           echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+
           echo "ECR image verified"
+
+
+      # ======================================================
+      # KUBECTL / HELM
+      # ======================================================
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v5.1.0
 
+
       - name: Setup Helm
         uses: azure/setup-helm@v5.0.0
+
 
       - name: Checkout platform repository
         uses: actions/checkout@v4
@@ -355,6 +410,7 @@ jobs:
           repository: ${{ env.PLATFORM_REPOSITORY }}
           path: boutique-platform-infra
           persist-credentials: false
+
 
       - name: Validate Helm chart
         run: |
@@ -373,6 +429,11 @@ jobs:
 
           echo "Helm chart validated"
 
+
+      # ======================================================
+      # EKS ACCESS
+      # ======================================================
+
       - name: Configure EKS access
         run: |
           aws eks update-kubeconfig \
@@ -388,7 +449,12 @@ jobs:
 
           echo "EKS access verified"
 
-      # OrderService needs PostgreSQL, Kafka and RabbitMQ.
+
+      # ======================================================
+      # ORDER SERVICE DEPENDENCIES
+      # PostgreSQL + Kafka + RabbitMQ
+      # ======================================================
+
       - name: Validate Order Service dependencies
         run: |
           FAILED=0
@@ -406,7 +472,10 @@ jobs:
             fi
           done
 
-          for SECRET in boutique-rds-credentials rabbitmq-credentials
+
+          for SECRET in \
+            boutique-rds-credentials \
+            rabbitmq-credentials
           do
             if kubectl get secret "$SECRET" \
               -n "$K8S_NAMESPACE" \
@@ -419,6 +488,7 @@ jobs:
             fi
           done
 
+
           if kubectl get secretproviderclass boutique-rds-secrets \
             -n "$K8S_NAMESPACE" \
             > /dev/null 2>&1
@@ -429,12 +499,17 @@ jobs:
             FAILED=1
           fi
 
+
           if [ "$FAILED" -ne 0 ]; then
-            echo "OrderService dependency validation failed"
+            echo "Order Service dependency validation failed"
             exit 1
           fi
 
-      # Prevent another deployment when Helm is already busy.
+
+      # ======================================================
+      # HELM CURRENT STATE
+      # ======================================================
+
       - name: Check Helm release state
         run: |
           HELM_STATUS="$(helm status "$HELM_RELEASE" \
@@ -453,7 +528,11 @@ jobs:
               ;;
           esac
 
-      # Helm updates the image and Kubernetes performs a rolling deployment.
+
+      # ======================================================
+      # DEPLOY
+      # ======================================================
+
       - name: Deploy Order Service with Helm
         run: |
           PREVIOUS_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
@@ -463,6 +542,7 @@ jobs:
 
           echo "Previous image: ${PREVIOUS_IMAGE:-none}"
           echo "New image     : $IMAGE_URI"
+
 
           if helm upgrade \
             --install \
@@ -481,10 +561,11 @@ jobs:
             echo "Helm deployment completed"
           else
             echo "Helm deployment failed"
+
             tail -n 100 /tmp/helm-deploy.log
 
             echo
-            echo "Current OrderService pods:"
+            echo "Current Order Service pods:"
 
             kubectl get pods \
               -n "$K8S_NAMESPACE" \
@@ -494,6 +575,11 @@ jobs:
 
             exit 1
           fi
+
+
+      # ======================================================
+      # ROLLOUT VALIDATION
+      # ======================================================
 
       - name: Validate Kubernetes rollout
         run: |
@@ -506,6 +592,7 @@ jobs:
             echo "Kubernetes rollout completed"
           else
             echo "Kubernetes rollout failed"
+
             tail -n 80 /tmp/rollout.log
 
             kubectl get pods \
@@ -517,19 +604,27 @@ jobs:
             exit 1
           fi
 
+
+      # ======================================================
+      # IMAGE / REPLICA VALIDATION
+      # ======================================================
+
       - name: Validate deployed image and replicas
         run: |
           DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
             -n "$K8S_NAMESPACE" \
             -o jsonpath='{.spec.template.spec.containers[0].image}')"
 
+
           READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
             -n "$K8S_NAMESPACE" \
             -o jsonpath='{.status.readyReplicas}')"
 
+
           DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
             -n "$K8S_NAMESPACE" \
             -o jsonpath='{.spec.replicas}')"
+
 
           if [[ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]]; then
             echo "Expected image: $IMAGE_URI"
@@ -537,13 +632,20 @@ jobs:
             exit 1
           fi
 
+
           if [[ "${READY:-0}" != "$DESIRED" ]]; then
             echo "Ready replicas: ${READY:-0}/${DESIRED}"
             exit 1
           fi
 
+
           echo "Image verified: $DEPLOYED_IMAGE"
           echo "Ready replicas: $READY/$DESIRED"
+
+
+      # ======================================================
+      # APPLICATION HEALTH
+      # ======================================================
 
       - name: Validate Order Service health
         run: |
@@ -552,12 +654,15 @@ jobs:
             -l kubernetes.io/service-name="$K8S_SERVICE" \
             -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{" "}{end}')"
 
+
           if [[ -z "$ENDPOINTS" ]]; then
-            echo "OrderService has no ready endpoints"
+            echo "Order Service has no ready endpoints"
             exit 1
           fi
 
+
           TEST_POD="orderservice-health-${GITHUB_RUN_ID}"
+
 
           cleanup() {
             kubectl delete pod "$TEST_POD" \
@@ -566,7 +671,9 @@ jobs:
               > /dev/null 2>&1 || true
           }
 
+
           trap cleanup EXIT
+
 
           kubectl run "$TEST_POD" \
             -n "$K8S_NAMESPACE" \
@@ -579,8 +686,9 @@ jobs:
               --show-error \
               --retry 5 \
               --retry-delay 3 \
-              "http://${K8S_SERVICE}:8084/actuator/health" \
+              "http://${K8S_SERVICE}:${SERVICE_PORT}/actuator/health" \
             > /dev/null
+
 
           kubectl wait \
             --for=jsonpath='{.status.phase}'=Succeeded \
@@ -589,17 +697,24 @@ jobs:
             --timeout=90s \
             > /dev/null
 
+
           HEALTH="$(kubectl logs "$TEST_POD" \
             -n "$K8S_NAMESPACE")"
 
+
           if echo "$HEALTH" | grep -q '"status":"UP"'
           then
-            echo "OrderService health: UP"
+            echo "Order Service health: UP"
           else
-            echo "OrderService health check failed"
+            echo "Order Service health check failed"
             echo "$HEALTH"
             exit 1
           fi
+
+
+      # ======================================================
+      # SUMMARY
+      # ======================================================
 
       - name: Deployment summary
         run: |
@@ -608,8 +723,9 @@ jobs:
             -o json \
             | jq -r '.[-1].revision')"
 
+
           echo "----------------------------------------"
-          echo "OrderService deployment completed"
+          echo "Order Service deployment completed"
           echo "Version        : $APP_VERSION"
           echo "Nexus artifact : $JAR_NAME"
           echo "ECR image      : $IMAGE_URI"
