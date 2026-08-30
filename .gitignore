@@ -31,3 +31,12 @@ github-sync-reports/
 code-backup-old/
 migration-backup-old/
 *.backup-*
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+*credentials*
+*secret*.txt
+.aws/
+.DS_Store
+.automation-logs/
